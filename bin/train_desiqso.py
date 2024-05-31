@@ -13,9 +13,6 @@ from spender import SpectrumAutoencoder
 from spender.data import desi_qso as desi 
 from spender.util import mem_report, resample_to_restframe
 
-# allows one to run fp16_train.py from home directory
-import sys;sys.path.insert(1, './')
-
 def prepare_train(seq,niter=800):
     for d in seq:
         if not "iteration" in d:d["iteration"]=niter
@@ -56,133 +53,16 @@ def get_all_parameters(models,instruments):
         print("parameter dict:",dicts[1])
     return dicts,n_parameters
 
-def consistency_loss(s, s_aug, individual=False):
-    batch_size, s_size = s.shape
-    x = torch.sum((s_aug - s)**2/(0.5)**2,dim=1)/s_size
-    sim_loss = torch.sigmoid(x)-0.5 # zero = perfect alignment
-    if individual:
-        return x, sim_loss
-    return sim_loss.sum()
-
-def similarity_loss(instrument, model, spec, w, z, s, slope=0.5, individual=False, wid=5, amp=3):
-    spec,w = resample_to_restframe(instrument.wave_obs,
-                                   model.decoder.wave_rest,
-                                   spec,w,z)
-
-    batch_size, spec_size = spec.shape
-    _, s_size = s.shape
-    device = s.device
-
-    # pairwise dissimilarity of spectra
-    S = (spec[None,:,:] - spec[:,None,:])**2
-
-    # pairwise weights
-    non_zero = w > 1e-6
-    N = (non_zero[None,:,:] * non_zero[:,None,:])
-    W = (1 / w)[None,:,:] + (1 / w)[:,None,:]
-    W =  N / W
-
-    N = N.sum(-1)
-    N[N==0] = 1
-    # dissimilarity of spectra
-    # of order unity, larger for spectrum pairs with more comparable bins
-    spec_sim = (W * S).sum(-1) / N
-
-    # dissimilarity of latents
-    s_sim = ((s[None,:,:] - s[:,None,:])**2).sum(-1) / s_size
-
-    # only give large loss of (dis)similarities are different (either way)
-    x = s_sim-spec_sim
-    sim_loss = torch.sigmoid(slope*x-0.5*wid)+torch.sigmoid(-slope*x-0.5*wid)
-    diag_mask = torch.diag(torch.ones(batch_size,device=device,dtype=bool))
-    sim_loss[diag_mask] = 0
-
-    if individual:
-        return s_sim,spec_sim,sim_loss
-    # total loss: sum over N^2 terms,
-    # needs to have amplitude of N terms to compare to fidelity loss
-    return amp*sim_loss.sum() / batch_size
-
 def restframe_weight(model,mu=5000,sigma=2000,amp=30):
     x = model.decoder.wave_rest
     return amp*torch.exp(-(0.5*(x-mu)/sigma)**2)
 
-def similarity_restframe(instrument, model, s=None, slope=1.0,
-                         individual=False, wid=5, bound=[4000,7000]):
-    _, s_size = s.shape
-    device = s.device
-
-    spec = model.decode(s)
-    wave = model.decoder.wave_rest
-    mask = (wave>bound[0])*(wave<bound[1])
-    spec /= spec[:,mask].median(dim=1)[0][:,None]
-    batch_size, spec_size = spec.shape
-    # pairwise dissimilarity of spectra
-    S = (spec[None,:,:] - spec[:,None,:])**2
-    # dissimilarity of spectra
-    # of order unity, larger for spectrum pairs with more comparable bins
-    W = restframe_weight(model)
-    spec_sim = (W * S).sum(-1) / spec_size
-    # dissimilarity of latents
-    s_sim = ((s[None,:,:] - s[:,None,:])**2).sum(-1) / s_size
-
-    # only give large loss of (dis)similarities are different (either way)
-    x = s_sim-spec_sim
-    sim_loss = torch.sigmoid(slope*x-wid/2)+torch.sigmoid(-slope*x-wid/2)
-    diag_mask = torch.diag(torch.ones(batch_size,device=device,dtype=bool))
-    sim_loss[diag_mask] = 0
-
-    if individual:
-        return s_sim,spec_sim,sim_loss
-
-    # total loss: sum over N^2 terms,
-    # needs to have amplitude of N terms to compare to fidelity loss
-    return sim_loss.sum() / batch_size
-
-def _losses(model,
-            instrument,
-            batch,
-            similarity=True,
-            slope=0,
-            skip=False
-           ):
-
+def Loss(model, instrument, batch):
     spec, w, z = batch
     # need the latents later on if similarity=True
     s = model.encode(spec)
-    if skip: return 0,0,s
-    loss = model.loss(spec, w, instrument, z=z, s=s)
 
-    if similarity:
-        sim_loss = similarity_restframe(instrument, model, s, slope=slope)
-    else: sim_loss = 0
-
-    return loss, sim_loss, s
-
-def get_losses(model,
-               instrument,
-               batch,
-               aug_fct=None,
-               similarity=True,
-               consistency=True,
-               slope=0
-               ):
-
-    loss, sim_loss, s = _losses(model, instrument, batch, similarity=similarity, slope=slope)
-
-    if aug_fct is not None:
-        batch_copy = aug_fct(batch,z_max=args.z_max)
-        loss_, sim_loss_, s_ = _losses(model, instrument, batch_copy, similarity=similarity, slope=slope,skip=True)
-    else:
-        loss_ = sim_loss_ = 0
-
-    if consistency and aug_fct is not None:
-        cons_loss = slope*consistency_loss(s, s_)
-    else:
-        cons_loss = 0
-
-    return loss, sim_loss, loss_, sim_loss_, cons_loss
-
+    return model.loss(spec, w, instrument, z=z, s=s)
 
 def checkpoint(accelerator, args, optimizer, scheduler, n_encoder, outfile, losses):
     unwrapped = [accelerator.unwrap_model(args_i).state_dict() for args_i in args]
@@ -220,14 +100,9 @@ def train(models,
           validloaders,
           n_epoch=200,
           outfile=None,
-          losses=None,
           verbose=False,
-          lr=1e-4,
-          n_batch=50,
-          aug_fcts=None,
-          similarity=True,
-          consistency=True,
-          ):
+          lr=1e-4, 
+          n_batch=50):
 
     n_encoder = len(models)
     model_parameters, n_parameters = get_all_parameters(models,instruments)
@@ -249,24 +124,8 @@ def train(models,
     optimizer = accelerator.prepare(optimizer)
 
     # define losses to track
-    n_loss = 5
     epoch = 0
-    if losses is None:
-        detailed_loss = np.zeros((2, n_encoder, n_epoch, n_loss))
-    else:
-        try:
-            epoch = len(losses[0][0])
-            n_epoch += epoch
-            detailed_loss = np.zeros((2, n_encoder, n_epoch, n_loss))
-            detailed_loss[:, :, :epoch, :] = losses
-            if verbose:
-                losses = tuple(detailed_loss[0, :, epoch-1, :])
-                vlosses = tuple(detailed_loss[1, :, epoch-1, :])
-                print(f'====> Epoch: {epoch-1}')
-                print('TRAINING Losses:', losses)
-                print('VALIDATION Losses:', vlosses)
-        except: # OK if losses are empty
-            pass
+    detailed_loss = np.zeros((2, n_encoder, n_epoch))
 
     if outfile is None:
         outfile = "checkpoint.pt"
@@ -278,12 +137,6 @@ def train(models,
         # turn on/off model decoder
         for p in models[0].decoder.parameters():
             p.requires_grad = mode['decoder']
-
-        slope = ANNEAL_SCHEDULE[(epoch_ - epoch)%len(ANNEAL_SCHEDULE)]
-        if n_epoch-epoch_<=10: slope=0 # turn off similarity
-
-        if verbose and similarity:
-            print("similarity info:",slope)
 
         for which in range(n_encoder):
 
@@ -301,17 +154,8 @@ def train(models,
             n_sample = 0
             for k, batch in enumerate(trainloaders[which]):
                 batch_size = len(batch[0])
-                losses = get_losses(
-                    models[which],
-                    instruments[which],
-                    batch,
-                    aug_fct=aug_fcts[which],
-                    similarity=similarity,
-                    consistency=consistency,
-                    slope=slope,
-                )
-                # sum up all losses
-                loss = functools.reduce(lambda a, b: a+b , losses)
+                loss = Loss(models[which], instruments[which], batch)
+
                 accelerator.backward(loss)
                 # clip gradients: stabilizes training with similarity
                 accelerator.clip_grad_norm_(model_parameters[0]['params'], 1.0)
@@ -320,7 +164,7 @@ def train(models,
                 optimizer.zero_grad()
 
                 # logging: training
-                detailed_loss[0][which][epoch_] += tuple( l.item() if hasattr(l, 'item') else 0 for l in losses )
+                detailed_loss[0][which][epoch_] += loss
                 n_sample += batch_size
 
                 # stop after n_batch
@@ -338,17 +182,9 @@ def train(models,
                 n_sample = 0
                 for k, batch in enumerate(validloaders[which]):
                     batch_size = len(batch[0])
-                    losses = get_losses(
-                        models[which],
-                        instruments[which],
-                        batch,
-                        aug_fct=aug_fcts[which],
-                        similarity=similarity,
-                        consistency=consistency,
-                        slope=slope,
-                    )
+                    loss = Loss(models[which], instruments[which], batch)
                     # logging: validation
-                    detailed_loss[1][which][epoch_] += tuple( l.item() if hasattr(l, 'item') else 0 for l in losses )
+                    detailed_loss[1][which][epoch_] += loss 
                     n_sample += batch_size
 
                     # stop after n_batch
@@ -359,8 +195,8 @@ def train(models,
 
         if verbose:
             mem_report()
-            losses = tuple(detailed_loss[0, :, epoch_, :])
-            vlosses = tuple(detailed_loss[1, :, epoch_, :])
+            losses = tuple(detailed_loss[0, :, epoch_])
+            vlosses = tuple(detailed_loss[1, :, epoch_])
             print('====> Epoch: %i'%(epoch))
             print('TRAINING Losses:', losses)
             print('VALIDATION Losses:', vlosses)
@@ -375,14 +211,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("dir", help="data file directory")
     parser.add_argument("outfile", help="output file name")
+    parser.add_argument("-t", "--tag", help="training data tag", type=str, default=None)
     parser.add_argument("-n", "--latents", help="latent dimensionality", type=int, default=2)
     parser.add_argument("-b", "--batch_size", help="batch size", type=int, default=512)
     parser.add_argument("-l", "--batch_number", help="number of batches per epoch", type=int, default=None)
     parser.add_argument("-r", "--rate", help="learning rate", type=float, default=1e-3)
     parser.add_argument("-zmax", "--z_max", help="constrain redshifts to z_max", type=float, default=0.8)
-    parser.add_argument("-a", "--augmentation", help="add augmentation loss", action="store_true")
-    parser.add_argument("-s", "--similarity", help="add similarity loss", action="store_true")
-    parser.add_argument("-c", "--consistency", help="add consistency loss", action="store_true")
     parser.add_argument("-C", "--clobber", help="continue training of existing model", action="store_true")
     parser.add_argument("-v", "--verbose", help="verbose printing", action="store_true")
     args = parser.parse_args()
@@ -404,24 +238,12 @@ if __name__ == "__main__":
     print(args.dir) 
 
     # data loaders
-    trainloaders = [ inst.get_data_loader(args.dir, tag="qso0", which="train",  batch_size=args.batch_size, shuffle=True, shuffle_instance=True) for inst in instruments ]
-    validloaders = [ inst.get_data_loader(args.dir,  tag="qso0", which="valid", batch_size=args.batch_size, shuffle=True, shuffle_instance=True) for inst in instruments ]
-
-    # get augmentation function
-    if args.augmentation:
-        aug_fcts = [ desi.DESI().augment_spectra ]
-    else:
-        aug_fcts = [ None ]
+    trainloaders = [ inst.get_data_loader(args.dir, tag=args.tag, which="train",  batch_size=args.batch_size, shuffle=True, shuffle_instance=True) for inst in instruments ]
+    validloaders = [ inst.get_data_loader(args.dir,  tag=args.tag, which="valid", batch_size=args.batch_size, shuffle=True, shuffle_instance=True) for inst in instruments ]
 
     # define training sequence
     FULL = {"data":[True],"decoder":True}
     train_sequence = prepare_train([FULL])
-
-    annealing_step = 0.1
-    ANNEAL_SCHEDULE = np.arange(0.0,2.0,annealing_step)
-
-    if args.verbose and args.similarity:
-        print("similarity_slope:",len(ANNEAL_SCHEDULE),ANNEAL_SCHEDULE)
 
     # define and train the model
     n_hidden = (64, 256, 1024)
@@ -432,8 +254,6 @@ if __name__ == "__main__":
                                    act=[nn.LeakyReLU()]*(len(n_hidden)+1)
                                    )
               for instrument in instruments ]
-    # use same decoder
-    if n_encoder==2:models[1].decoder = models[0].decoder
 
     n_epoch = sum([item['iteration'] for item in train_sequence])
     init_t = time.time()
@@ -453,7 +273,8 @@ if __name__ == "__main__":
         losses = losses[:,:,non_zero,:]
 
     train(models, instruments, trainloaders, validloaders, n_epoch=n_epoch,
-          n_batch=args.batch_number, lr=args.rate, aug_fcts=aug_fcts, similarity=args.similarity, consistency=args.consistency, outfile=args.outfile, losses=losses, verbose=args.verbose)
+          n_batch=args.batch_number, lr=args.rate, outfile=args.outfile, 
+          verbose=args.verbose)
 
     if args.verbose:
         print("--- %s seconds ---" % (time.time()-init_t))
