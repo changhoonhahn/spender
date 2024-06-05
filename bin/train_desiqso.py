@@ -216,6 +216,7 @@ if __name__ == "__main__":
     parser.add_argument("-b", "--batch_size", help="batch size", type=int, default=512)
     parser.add_argument("-l", "--batch_number", help="number of batches per epoch", type=int, default=None)
     parser.add_argument("-r", "--rate", help="learning rate", type=float, default=1e-3)
+    parser.add_argument("-zmin", "--z_min", help="constrain redshifts to z_min", type=float, default=0.0)
     parser.add_argument("-zmax", "--z_max", help="constrain redshifts to z_max", type=float, default=0.8)
     parser.add_argument("-C", "--clobber", help="continue training of existing model", action="store_true")
     parser.add_argument("-v", "--verbose", help="verbose printing", action="store_true")
@@ -228,7 +229,7 @@ if __name__ == "__main__":
     # restframe wavelength for reconstructed spectra
     # Note: represents joint dataset wavelength range
     lmbda_min = instruments[0].wave_obs[0]/(1.0+args.z_max) # 2000 A
-    lmbda_max = instruments[0].wave_obs[-1] # 9824 A
+    lmbda_max = instruments[0].wave_obs[-1]/(1.0+args.z_min) # 9824 A
     bins = 9780
     wave_rest = torch.linspace(lmbda_min, lmbda_max, bins, dtype=torch.float32)
     
